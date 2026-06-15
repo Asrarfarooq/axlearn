@@ -42,9 +42,11 @@ from axlearn.common.config import TrainerConfigFn, config_for_function
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.layers import RMSNorm
 from axlearn.common.mixture_of_experts import TransformerFeedForwardMoE, get_outer_batch_from_mesh
+from axlearn.common.quantized_dot_general.layers import QuantizedDotGeneral, DotGeneralQuantizationType
 from axlearn.common.trainer import SpmdTrainer
 from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
+    FP8ConfigModifier,
     GradientAccumulationModifier,
     MeshShapeModifier,
     RematSpecModifier,
@@ -214,6 +216,68 @@ def get_trainer_kwargs(
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=True,
                                         policy=offload_attention_proj_policy,
+                                    ),
+                                }
+                            ),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-7x-8",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=-1, expert=8)
+                            ),
+                            # Ensure we set the default tpu_block_size=2048 on TPU 7x
+                            V7xFlashConfigModifier.default_config(),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved=None,
+                                            names_which_can_be_offloaded="|".join(
+                                                [
+                                                    RematRegexSavePatterns.INPUT.value,
+                                                ]
+                                            ),
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
+                                    ),
+                                }
+                            ),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-7x-(16|32|64)",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=-1, expert=4)
+                            ),
+                            # Ensure we set the default tpu_block_size=2048 on TPU 7x
+                            V7xFlashConfigModifier.default_config(),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved=None,
+                                            names_which_can_be_offloaded="|".join(
+                                                [
+                                                    RematRegexSavePatterns.INPUT.value,
+                                                ]
+                                            ),
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
                                     ),
                                 }
                             ),
@@ -556,8 +620,20 @@ def trainer_configs(
                 cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
                 # pytype: enable=annotation-type-mismatch
                 cfg.input.batcher.feed_batch_size = 8
+                cfg.input.input_dispatcher.global_logical_batch_size = 8
                 for evaler in cfg.evalers.values():
                     evaler.input.batcher.feed_batch_size = 8
+                    evaler.input.input_dispatcher.global_logical_batch_size = 8
+
+                # Fix MoE outer_batch for single-host (data=2, fsdp=1, so outer_batch=2)
+                for layer_cfg in cfg.model.decoder.transformer.layer.layer:
+                    if (
+                        hasattr(layer_cfg, "feed_forward")
+                        and layer_cfg.feed_forward is not None
+                        and issubclass(layer_cfg.feed_forward.klass, TransformerFeedForwardMoE)
+                    ):
+                        layer_cfg.feed_forward.outer_batch = 2
+
                 remat_modifier = (
                     RematSpecModifier.default_config()
                     .set(
@@ -576,5 +652,63 @@ def trainer_configs(
             # Make single-host config
             make_single_host_config_func = functools.partial(make_single_host_config, config_name)
             config_map[f"{config_name}-single-host"] = make_single_host_config_func
+
+        def make_fp8_config(base_config_name: str) -> SpmdTrainer.Config:
+            cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
+            for accelerator, current_config in cfg.mesh_rules:
+                if any(
+                    supported_accelerator in accelerator
+                    for supported_accelerator in ["tpu-7x", "tpu-v6e", "gpu-p5"]
+                ):
+                    if isinstance(current_config, ChainConfigModifier.Config):
+                        current_config.config_modifiers.append(
+                            FP8ConfigModifier.default_config().set(fp8_amax_history_length=128)
+                        )
+                    else:
+                        current_config = ChainConfigModifier.default_config().set(
+                            config_modifiers=[
+                                MeshShapeModifier.default_config().set(mesh_shape=current_config),
+                                FP8ConfigModifier.default_config().set(fp8_amax_history_length=128),
+                            ]
+                        )
+            return cfg
+
+        if model_size != "test":
+            make_fp8_config_func = functools.partial(make_fp8_config, config_name)
+            config_map[f"{config_name}-fp8"] = make_fp8_config_func
+            if model_size == "Switch-Base":
+                make_single_host_fp8_config_func = functools.partial(
+                    make_single_host_config, f"{config_name}-fp8"
+                )
+                config_map[f"{config_name}-fp8-single-host"] = make_single_host_fp8_config_func
+
+                def make_single_host_pallas_fp8_config() -> SpmdTrainer.Config:
+                    cfg = make_single_host_fp8_config_func()
+                    
+                    cfg.input.batcher.feed_batch_size = 8
+                    cfg.input.input_dispatcher.global_logical_batch_size = 8
+                    for evaler in cfg.evalers.values():
+                        evaler.input.batcher.feed_batch_size = 8
+                        evaler.input.input_dispatcher.global_logical_batch_size = 8
+                    
+                    def visit_fn(_, value):
+                        klass_val = getattr(value, "klass", None)
+                        if klass_val == FP8ConfigModifier or (isinstance(klass_val, str) and "FP8ConfigModifier" in klass_val):
+                            value.use_pallas_kernel = True
+                            
+                    for rule in cfg.mesh_rules:
+                        accelerator, modifier = rule
+                        if hasattr(modifier, "config_modifiers"):
+                            for m in modifier.config_modifiers:
+                                klass_m = getattr(m, "klass", None)
+                                if klass_m == FP8ConfigModifier or (isinstance(klass_m, str) and "FP8ConfigModifier" in klass_m):
+                                    m.use_pallas_kernel = True
+                                elif hasattr(m, "visit"):
+                                    m.visit(visit_fn=visit_fn)
+                        elif hasattr(modifier, "visit"):
+                            modifier.visit(visit_fn=visit_fn)
+                    return cfg
+
+                config_map[f"{config_name}-pallas-fp8-single-host"] = make_single_host_pallas_fp8_config
 
     return config_map

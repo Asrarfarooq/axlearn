@@ -380,7 +380,7 @@ class BaseBastionManagedJob(FlagConfigurable):
         cfg: BaseBastionManagedJob.Config = self.config
         from_vm = running_from_vm()
 
-        if not from_vm:
+        if not from_vm or os.environ.get("BASTION_TIER") == "disabled":
             os.environ["BASTION_TIER"] = "disabled"
             self._bundler.bundle(cfg.name)
 

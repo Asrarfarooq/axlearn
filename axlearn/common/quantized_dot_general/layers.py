@@ -134,6 +134,8 @@ class QuantizedDotGeneral(BaseQuantizedEinsum):
         # from the activations of the current iteration. For more details, see
         # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html
         fp8_amax_history_length: Optional[int] = None
+        # If True, use the optimized Pallas FP8 matmul kernel on TPU.
+        use_pallas_kernel: bool = False
 
     def __init__(self, cfg: Config, *, parent: Module):
         super().__init__(cfg, parent=parent)
@@ -166,9 +168,9 @@ class QuantizedDotGeneral(BaseQuantizedEinsum):
                     "fp8_amax_history_length should not be specified when using Int8 quantization."
                 )
         elif cfg.quantization_type == DotGeneralQuantizationType.FP_8:
-            # TODO(jiarui): Is there a way to identify if we are running on H100?
-            if jax.default_backend() != "gpu":
-                raise NotImplementedError("Fp8 quantization is only available on H100 GPU")
+            # Allow FP8 quantization on supported GPUs and TPUs
+            if jax.default_backend() not in ["gpu", "tpu"]:
+                raise NotImplementedError("Fp8 quantization is only available on supported GPUs and TPUs")
         elif cfg.quantization_type is not None:
             raise KeyError(
                 f"Unrecognized quantization type {cfg.quantization_type}. "
@@ -292,7 +294,10 @@ class QuantizedDotGeneral(BaseQuantizedEinsum):
         history_params = (
             [self.parameters[x.value] for x in FP8AmaxHistoryParams] if is_delayed else [None] * 3
         )
-        fn = fp8_ops.q_dot_q
+        if self.config.use_pallas_kernel and jax.default_backend() == "tpu":
+            fn = fp8_ops.pallas_q_dot_q
+        else:
+            fn = fp8_ops.q_dot_q
         if (
             len(scale_params[0].shape) > 0
             and lhs.shape[0] == rhs.shape[0]

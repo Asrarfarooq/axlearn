@@ -1168,6 +1168,7 @@ def trainer_configs(
                         "a4-highgpu-8g",
                         "p5.48xlarge",
                         "p4de.24xlarge",
+                        "tpu-7x",  # Added to enable Trillium support
                     ]
                 ):
                     # If we already are using ChainConfigModifier, just append the FP8ConfigModifier
@@ -1251,5 +1252,28 @@ def trainer_configs(
                     make_single_host_config, f"{config_name}-fp8"
                 )
                 config_map[f"{config_name}-fp8-single-host"] = make_single_host_fp8_config_func
+
+                def make_single_host_pallas_fp8_config() -> SpmdTrainer.Config:
+                    cfg = make_single_host_fp8_config_func()
+                    
+                    def visit_fn(_, value):
+                        klass_val = getattr(value, "klass", None)
+                        if klass_val == FP8ConfigModifier or (isinstance(klass_val, str) and "FP8ConfigModifier" in klass_val):
+                            value.use_pallas_kernel = True
+                            
+                    for rule in cfg.mesh_rules:
+                        accelerator, modifier = rule
+                        if hasattr(modifier, "config_modifiers"):
+                            for m in modifier.config_modifiers:
+                                klass_m = getattr(m, "klass", None)
+                                if klass_m == FP8ConfigModifier or (isinstance(klass_m, str) and "FP8ConfigModifier" in klass_m):
+                                    m.use_pallas_kernel = True
+                                elif hasattr(m, "visit"):
+                                    m.visit(visit_fn=visit_fn)
+                        elif hasattr(modifier, "visit"):
+                            modifier.visit(visit_fn=visit_fn)
+                    return cfg
+
+                config_map[f"{config_name}-pallas-fp8-single-host"] = make_single_host_pallas_fp8_config
 
     return config_map

@@ -96,12 +96,9 @@ class FujiV3Vocabulary:
         # pylint: disable-next=import-outside-toplevel
         from tokenizers import Tokenizer
 
-        data_dir = get_data_dir()
-        data_dir = (
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
-            if data_dir is None or data_dir == "FAKE"
-            else data_dir
-        )
+        # Always use the local bundled data directory for the tokenizer
+        # to bypass the missing file in the public GCS bucket.
+        data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")
         filename = os.path.join(data_dir, "tokenizers", "hf", filename)
         if filename.startswith("gs:") or filename.startswith("s3:"):
             # Create a different file for each usage.
@@ -121,7 +118,11 @@ class FujiV3Vocabulary:
         for token in ("<|pad_id|>", "<|finetune_right_pad_id|>"):
             if token in self.vocab:
                 return self.vocab[token]
-        raise ValueError("Unable to infer pad token.")
+        # Fallback to eos_id if no pad token is defined.
+        try:
+            return self.eos_id
+        except ValueError:
+            raise ValueError("Unable to infer pad token.")
 
     @property
     def eos_id(self) -> Optional[int]:

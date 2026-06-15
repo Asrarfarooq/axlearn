@@ -345,6 +345,7 @@ class FP8ConfigModifier(ConfigModifier):
         """Configure FP8ConfigModifier. See QuantizedDotGeneral.Config."""
 
         fp8_amax_history_length: Required[int] = REQUIRED
+        use_pallas_kernel: bool = False
 
     def __call__(self, cfg: SpmdTrainer.Config) -> SpmdTrainer.Config:
         """Override dense layer to use FP8 quantized dot and add gradient rules for FP8 stats."""
@@ -352,6 +353,7 @@ class FP8ConfigModifier(ConfigModifier):
         quantized_dot_general = QuantizedDotGeneral.default_config().set(
             quantization_type=DotGeneralQuantizationType.FP_8,
             fp8_amax_history_length=override_cfg.fp8_amax_history_length,
+            use_pallas_kernel=override_cfg.use_pallas_kernel,
         )
 
         def visit_fn(_, value):
